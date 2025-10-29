@@ -14,7 +14,7 @@ from sentence_transformers import SentenceTransformer
 
 # --- Configuração do Cérebro Gerador (Gemini) ---
 try:
-    GOOGLE_API_KEY = "AIzaSyAeaafjuxuxm1CVbtqsBpI477hgydwaY80"
+    GOOGLE_API_KEY = "test"
     genai.configure(api_key=GOOGLE_API_KEY)
     model_gerador = genai.GenerativeModel('gemini-1.5-flash-latest')  # Modelo rápido para RAG
     print("🤖 [Status] Cérebro Gerador (Gemini) inicializado.")
