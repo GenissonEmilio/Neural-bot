@@ -2,19 +2,34 @@ import time
 import json
 import random
 import numpy as np
-import chromadb  # <-- Novo
+import chromadb
+import google.generativeai as genai
+
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.svm import SVC
 from sklearn.pipeline import Pipeline
 from sentence_transformers import SentenceTransformer
 
-# --- 0. Constantes de Confiança ---
+# --- 0. Configurações Globais ---
+
+# --- Configuração do Cérebro Gerador (Gemini) ---
+try:
+    GOOGLE_API_KEY = "AIzaSyAeaafjuxuxm1CVbtqsBpI477hgydwaY80"
+    genai.configure(api_key=GOOGLE_API_KEY)
+    model_gerador = genai.GenerativeModel('gemini-1.5-flash-latest')  # Modelo rápido para RAG
+    print("🤖 [Status] Cérebro Gerador (Gemini) inicializado.")
+except Exception as e:
+    print("🚨 ERRO: Não foi possível configurar a API do Gemini. Verifique sua chave de API.")
+    print(f"Detalhe: {e}")
+    exit()
+
+# --- Constantes de Confiança ---
 LIMITE_CONFIANCA_CONVERSA = 0.7  # (SVC) 70% de certeza que é um 'oi', 'tchau', etc.
-LIMITE_DISTANCIA_FATO = 0.5  # (Chroma) Distância de cosseno. MENOR é MELHOR. 0.5 é um bom corte.
+LIMITE_DISTANCIA_FATO = 0.6  # (Chroma) Aumentamos um pouco, para pegar mais contexto
+N_RESULTADOS_BUSCA = 3  # <-- NOVO: Buscar os 3 fatos mais relevantes
 
 # --- 1. CÉREBRO 1: O BOT CONVERSACIONAL (Classificador SVC) ---
-# (Esta parte é idêntica à v3, apenas carrega o conhecimento.json e treina o SVC)
-
+# (Esta parte é idêntica ao v4, treinando o classificador de intentos)
 ARQUIVO_JSON_CONVERSA = 'conhecimento.json'
 print(f"🤖 [Status] Carregando Cérebro Conversacional de '{ARQUIVO_JSON_CONVERSA}'...")
 try:
@@ -32,10 +47,6 @@ for intento, dados in base_conhecimento_conversa.items():
             frases_de_treino_conversa.append(exemplo)
             intentos_de_treino_conversa.append(intento)
 
-if not frases_de_treino_conversa:
-    print("🚨 ERRO: Nenhuma frase de treino carregada do 'conhecimento.json'.")
-    exit()
-
 modelo_conversacional = Pipeline([
     ('vetorizador', TfidfVectorizer()),
     ('classificador', SVC(kernel='linear', probability=True))
@@ -44,74 +55,91 @@ modelo_conversacional.fit(frases_de_treino_conversa, intentos_de_treino_conversa
 print("🤖 [Status] Cérebro Conversacional treinado.")
 
 # --- 2. CÉREBRO 2: O BOT FACTUAL (Conexão com ChromaDB) ---
+# (Esta parte é idêntica ao v4, conectando ao ChromaDB)
 
 NOME_MODELO_EMBEDDING = 'paraphrase-multilingual-MiniLM-L12-v2'
 NOME_COLECAO = "fatos_bot"
 CAMINHO_DB = "./chroma_db"
 
-print(f"🤖 [Status] Carregando Modelo de Embedding Factual ('{NOME_MODELO_EMBEMBEDDING}')...")
+print(f"🤖 [Status] Carregando Modelo de Embedding Factual ('{NOME_MODELO_EMBEDDING}')...")
 try:
-    # Ainda precisamos do modelo para GERAR O VETOR da pergunta do usuário
     modelo_factual_search = SentenceTransformer(NOME_MODELO_EMBEDDING)
-    print("🤖 [Status] Modelo Factual carregado.")
+    print("🤖 [Status] Modelo Factual (Embedding) carregado.")
 except Exception as e:
     print(f"🚨 ERRO ao carregar modelo SentenceTransformer: {e}")
     exit()
 
-print("🤖 [Status] Conectando ao Banco de Dados Vetorial...")
+print("🤖 [Status] Conectando ao Banco de Dados Vetorial (ChromaDB)...")
 try:
     client = chromadb.PersistentClient(path=CAMINHO_DB)
     collection_fatos = client.get_collection(name=NOME_COLECAO)
     print(f"🤖 [Status] Conectado ao ChromaDB! {collection_fatos.count()} fatos indexados.")
 except Exception as e:
     print(f"🚨 ERRO: Não foi possível conectar ao ChromaDB em '{CAMINHO_DB}'.")
-    print("🚨 Você executou o script 'popular_db.py' primeiro?")
     exit()
 
 
-# --- 3. REMOÇÃO DAS FUNÇÕES ANTIGAS ---
-# NÃO precisamos mais de:
-# - carregar 'fatos.json'
-# - 'base_fatos_lista' ou 'base_fatos_embeddings'
-# - 'calcular_similaridade_cosseno'
-# - 'buscar_fato_semantico'
-# O ChromaDB faz tudo isso por nós!
+# --- 3. NOVAS FUNÇÕES: GERAÇÃO (RAG) ---
 
-# --- 4. Nova Função de Busca Vetorial ---
-
-def buscar_fato_no_chroma(pergunta_usuario_emb):
+def buscar_contexto_no_chroma(pergunta_usuario_emb):
     """
-    Busca no ChromaDB o fato mais similar à pergunta.
+    Busca no ChromaDB os N fatos mais similares à pergunta.
     """
     try:
-        # O ChromaDB espera uma lista de vetores (no nosso caso, só um)
         query_emb_list = pergunta_usuario_emb.tolist()
-
-        # Faz a busca! Pede o vizinho mais próximo (n_results=1)
         results = collection_fatos.query(
             query_embeddings=[query_emb_list],
-            n_results=1
+            n_results=N_RESULTADOS_BUSCA  # <-- Modificado para N resultados
         )
 
-        # Analisa os resultados
-        if not results['documents']:
-            return None, 1.0  # Retorna 'None' e distância máxima (1.0)
+        documentos = results.get('documents', [[]])[0]
+        distancias = results.get('distances', [[]])[0]
 
-        resposta = results['documents'][0][0]
-        distancia = results['distances'][0][0]
-
-        return resposta, distancia
+        return documentos, distancias
 
     except Exception as e:
         print(f"🚨 ERRO durante a busca no ChromaDB: {e}")
-        return None, 1.0
+        return [], []
 
 
-# --- 5. A Lógica Híbrida Principal (Modificada) ---
-
-def obter_resposta_hibrida(pergunta_usuario):
+def gerar_resposta_com_llm(contexto, pergunta_usuario):
     """
-    Decide qual cérebro usar para responder.
+    Usa o Cérebro Gerador (Gemini) para sintetizar uma resposta.
+    """
+    print("🤖 [Status] Cérebro Gerador (Gemini) está pensando...")
+
+    # Este é o "prompt" que controla o LLM
+    prompt_template = f"""
+    Você é um assistente prestativo. Sua tarefa é responder à pergunta do usuário
+    usando **apenas** o contexto fornecido.
+    Se o contexto não contiver a resposta, diga "Desculpe, eu não tenho
+    informação sobre isso no meu banco de dados."
+
+    **Contexto Fornecido:**
+    ---
+    {contexto}
+    ---
+
+    **Pergunta do Usuário:**
+    {pergunta_usuario}
+
+    **Sua Resposta:**
+    """
+
+    try:
+        # Gera a resposta
+        response = model_gerador.generate_content(prompt_template)
+        return response.text.strip(), "fato_gerado"
+    except Exception as e:
+        print(f"🚨 ERRO ao gerar resposta com LLM: {e}")
+        return "Ocorreu um erro ao tentar gerar a resposta.", "fallback"
+
+
+# --- 4. A Lógica Híbrida Principal (Modificada para RAG) ---
+
+def obter_resposta_hibrida_rag(pergunta_usuario):
+    """
+    Decide qual cérebro usar: SVC (Conversa) ou RAG (Fatos).
     """
     pergunta_limpa = pergunta_usuario.lower().strip()
     if not pergunta_limpa:
@@ -127,28 +155,28 @@ def obter_resposta_hibrida(pergunta_usuario):
         resposta = random.choice(base_conhecimento_conversa[melhor_intento]["respostas"])
         return resposta, melhor_intento
 
-    # --- CÉREBRO 2: TENTATIVA FACTUAL (Modificada para ChromaDB) ---
-    # 1. Transformar a pergunta do usuário em um vetor (embedding)
-    # Usamos .encode() que retorna um array numpy, perfeito para a nova função
+    # --- CÉREBRO 2: TENTATIVA FACTUAL (AGORA COM RAG) ---
+
+    # 1. BUSCA (Retrieve): Transformar pergunta em vetor e buscar no Chroma
     pergunta_emb = modelo_factual_search.encode(pergunta_limpa)
+    documentos_contexto, distancias_contexto = buscar_contexto_no_chroma(pergunta_emb)
 
-    # 2. Buscar a resposta no ChromaDB
-    resposta_fato, distancia_fato = buscar_fato_no_chroma(pergunta_emb)
+    # Se não encontramos nada ou o fato mais próximo é muito ruim, desistimos
+    if not documentos_contexto or distancias_contexto[0] > LIMITE_DISTANCIA_FATO:
+        return random.choice(base_conhecimento_conversa["fallback"]["respostas"]), "fallback"
 
-    # ATENÇÃO: Agora comparamos DISTÂNCIA (menor é melhor)
-    if resposta_fato and distancia_fato < LIMITE_DISTANCIA_FATO:
-        # Encontramos uma resposta factual com boa confiança!
-        return resposta_fato, "fato_encontrado"
+    # 2. AUMENTA (Augment): Formata o contexto para o LLM
+    contexto_formatado = "\n".join(f"- {doc}" for doc in documentos_contexto)
 
-    # --- FALLBACK REAL ---
-    resposta = random.choice(base_conhecimento_conversa["fallback"]["respostas"])
-    return resposta, "fallback"
+    # 3. GERA (Generate): Pede ao Gemini para criar a resposta
+    resposta_gerada, intento = gerar_resposta_com_llm(contexto_formatado, pergunta_limpa)
+    return resposta_gerada, intento
 
 
-# --- 6. Loop Principal do Chat (Igual ao v3) ---
+# --- 5. Loop Principal do Chat ---
 def iniciar_chat():
-    print("🤖 Olá! Eu sou o ChatBot v4 (Híbrido com Banco de Dados Vetorial ChromaDB).")
-    print("Eu posso conversar e responder fatos indexados.")
+    print("🤖 Olá! Eu sou o ChatBot v5 (RAG com Gemini e ChromaDB).")
+    print("Eu posso conversar e gerar respostas complexas sobre meus fatos.")
     print("Digite 'tchau' ou 'adeus' para sair.")
     print("-" * 30)
 
@@ -156,10 +184,11 @@ def iniciar_chat():
     while rodando:
         pergunta = input("Você: ")
 
-        resposta, intento = obter_resposta_hibrida(pergunta)
+        resposta, intento = obter_resposta_hibrida_rag(pergunta)
 
+        # O "delay" agora é real, pois a API leva 1-2 segundos
         print("🤖... ", end="", flush=True)
-        time.sleep(0.5)
+        # time.sleep(0.5) # Não precisamos mais de um sleep falso
         print(resposta)
 
         if intento == "despedida":
